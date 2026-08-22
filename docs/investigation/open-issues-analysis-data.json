@@ -1,0 +1,339 @@
+[
+  {
+    "number": 67,
+    "title": "Add check option",
+    "summary": "jwilder (2015) requests a \"check\" command that runs before the notify command, so an invalid generated file is not applied — e.g. run `nginx -t` and only run `nginx reload` if it passes, preventing reload of a broken config. In the discussion, contributors split it into two interpretations: a single file-level validation after generation (md5's reading) and a per-container check during generation that includes/excludes containers based on a script's exit code (jgallen23's reading); jgallen23 said he wanted both.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "No check/validation mechanism exists in the current code. internal/generator/generator.go runNotifyCmd (lines 324-342) unconditionally exec's config.NotifyCmd via /bin/sh -c with no pre-validation, and is invoked directly after template.GenerateFile in all three trigger paths (generateFromContainers L137, generateAtInterval L168, generateFromEvents L217). internal/config/config.go Config struct has no check field, and cmd/docker-gen/main.go initFlags (notify flags L127-130) has no -check flag. The original motivation (avoid reloading a syntactically-broken nginx.conf) is still entirely valid for the nginx-proxy use case this fork targets.",
+    "difficulty": "easy",
+    "effortEstimate": "File-level check: ~0.5 day (CLI flag + config field + TOML + a guard in runNotifyCmd + README + a small test). Per-container check: 2-4 days and design-heavy; recommend not doing it.",
+    "recommendedApproach": "Implement only the file-level interpretation (interpretation a). 1) Add `CheckCmd string` to the Config struct in internal/config/config.go. 2) Add a `-check` string flag in cmd/docker-gen/main.go initFlags (next to -notify, L127-130) and populate cfg.CheckCmd in the cfg literal (L197-208); TOML support comes for free via BurntSushi/toml (document a `checkcmd` key). 3) In internal/generator/generator.go, add a runCheckCmd(config) that, when config.CheckCmd != \"\", runs `/bin/sh -c <CheckCmd>` (mirroring runNotifyCmd) and returns its error; then in runNotifyCmd (or in each caller) skip the notify when the check fails, logging the failure. Cleanest: gate inside runNotifyCmd so all three call sites (L137, L168, L217) are covered with one change. Add README docs under the notify flags (L127) and the config-file syntax section (L171-204). Skip the per-container variant — it overlaps with existing container-filter functionality, lacks a clear spec, and would substantially complicate the generation loop in getContainers.",
+    "priority": "low",
+    "rationale": "Genuinely useful for the nginx-proxy reload-safety scenario and cheap to build, but a near-equivalent can already be expressed today by chaining shell in the existing notify command (e.g. `nginx -t && nginx -s reload`), which is why it has sat open for 10 years without anyone needing a dedicated flag. Worth doing only as a low-effort ergonomics/clarity improvement (separate exit-code logging, clearer config) if the fork is already touching notify handling; otherwise skippable.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/config/config.go",
+      "cmd/docker-gen/main.go",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 131,
+    "title": "Allow docker-gen to be used as a library",
+    "summary": "A 2015 request to restructure docker-gen so it can be consumed both as a standalone CLI binary and as an embedded Go library. The discussion also floats a secondary feature: a callback/notification API that hands the caller []*RunningContainer whenever the running container set changes. An early WIP branch (appropriate/docker-gen:generator) stalled on how to model the GeneratorConfig struct.",
+    "category": "feature-request",
+    "currentRelevance": "partially-addressed",
+    "relevanceReason": "The architectural refactor the issue asked for has largely happened: internal/generator/generator.go now has a clean GeneratorConfig struct (lines 35-46) and a NewGenerator constructor (line 48), and cmd/docker-gen/main.go is a thin CLI wrapper that just populates GeneratorConfig and calls Generate() (main.go:244-260). This is exactly the standalone-vs-embedded split the 2015 thread wanted, and it resolves the GeneratorConfig modeling problem that stalled the original WIP branch. HOWEVER the core ask -- usable AS A LIBRARY -- is explicitly NOT met today: every consumable package (generator, config, context, template, dockerclient, utils) lives under internal/, which Go tooling forbids any external module from importing (module path github.com/nginx-proxy/docker-gen, go.mod line 1). A second, smaller blocker: generator.NewGenerator returns the UNEXPORTED type *generator (generator.go:22 'type generator struct', generator.go:48), so even a public package would hand callers a type they cannot name. The secondary callback-API idea from the comments is unaddressed: generateFromContainers (generator.go:124-141) goes straight to template.GenerateFile + runNotifyCmd with no programmatic hook.",
+    "difficulty": "medium",
+    "effortEstimate": "1-3 days for the minimal \"make it importable\" path (promote packages out of internal/, export the generator type); 1-2 weeks if also adding a stable, documented public API surface with a container-change callback and tests/docs.",
+    "recommendedApproach": "Minimal viable path (gets the actual feature): (1) Move the packages a consumer needs out of internal/ into a public location, e.g. create a top-level package/ tree or expose github.com/nginx-proxy/docker-gen/generator (and its deps config, context, template, dockerclient, utils). Easiest mechanically: rename internal/ -> pkg/ or move these dirs up; update all import paths (they are all rooted at .../internal/...). (2) Export the generator struct: rename 'type generator' to 'type Generator' in generator.go:22 and update NewGenerator's return type (generator.go:48) and all method receivers -- so callers can hold the value. (3) Add a short README section showing import + NewGenerator(GeneratorConfig{...}) + Generate() usage. Optional value-add addressing the comment thread: add a callback field to GeneratorConfig (e.g. OnContainersChanged func([]*context.RuntimeContainer)) invoked inside generateFromContainers / generateFromEvents after getContainers, giving embedders the change-notification API requested. Caveat: moving out of internal/ converts the entire API into a public contract subject to semver -- the maintainers chose internal/ deliberately, so a fork can do this freely but upstream may resist. context.RuntimeContainer is already an exported, reasonably stable shape, so exposing it is low-risk.",
+    "priority": "low",
+    "rationale": "For a downstream fork this is only worth doing if you actually intend to import docker-gen as a Go dependency rather than shell out to the binary or vendor the source. The CLI already covers the common integration patterns (host install, bundled container, sidecar) documented in README.md. The mechanical refactor is straightforward but commits the fork to maintaining a public API surface forever, and the internal/ placement is an intentional upstream decision -- so any such change is likely fork-only and will create perpetual merge friction with upstream. Unless library embedding is a concrete requirement for the fork, skip or defer; if it is required, the minimal path is cheap and well-scoped because the GeneratorConfig/NewGenerator architecture already exists.",
+    "keyFiles": [
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\generator\\generator.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\cmd\\docker-gen\\main.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\config\\config.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\context\\context.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\template\\template.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\go.mod",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\README.md"
+    ],
+    "relatedItems": [
+      130
+    ]
+  },
+  {
+    "number": 151,
+    "title": "A function which limits containers to only those to which docker-gen has access to",
+    "summary": "Requests a template helper that filters the container list down to only containers reachable by the docker-gen container itself — i.e., those sharing at least one Docker network with the docker-gen instance — without the template author hardcoding network names. The request also asks that this be reactive: network attach/detach of the docker-gen container should trigger regeneration. Background is in issue #149 (generating an /etc/hosts file), where it became clear docker-gen sees all containers across all networks, not just reachable ones.",
+    "category": "template-function",
+    "currentRelevance": "partially-addressed",
+    "relevanceReason": "The underlying capability now exists in current code; only the convenience helper is missing. internal/context/context.go exposes RuntimeContainer.Networks (each with Name) and Docker.CurrentContainerID (populated by GetCurrentContainerID(), lines 45 and 155-231). internal/generator/generator.go getContainers() populates per-container networks (lines 459-475) and lists with All:true (line 400), so the docker-gen container itself is present in the data set. The reactivity ask is also addressed: cmd/docker-gen/main.go lines 149-150 expose -event-filter, and generateFromEvents (generator.go 184-322) re-runs the pipeline on those events, so adding event=connect/event=disconnect makes network attach/detach trigger regeneration (these Docker events did not exist in 2016). What is still missing is a dedicated template function; the existing where/whereAny (internal/template/where.go) operate on flat keys via deepGet and cannot cleanly express 'containers sharing a network with the current container' without the author hardcoding network names.",
+    "difficulty": "easy",
+    "effortEstimate": "0.5-1 day including a function, unit test, and README docs",
+    "recommendedApproach": "Add a template function, e.g. whereSharedNetwork(containers, currentContainerID) or sameNetwork, in internal/template/where.go following the generalizedWhereLabel pattern (it already takes context.Context). Implementation: find the container whose ID equals the passed CurrentContainerID, collect its set of Network.Name values, then return only containers that share at least one network name. Register it in internal/template/template.go newTemplate() FuncMap (alongside the other where* funcs, lines 97-105). Document it in README.md near the RuntimeContainer/Docker struct docs (around lines 252-342) with an example like {{ $self := .Docker.CurrentContainerID }}{{ range whereSharedNetwork $ $self }}, and note that users should add -event-filter event=connect -event-filter event=disconnect to make it reactive. No changes to generator.go or context.go are required since Networks and CurrentContainerID are already populated. Optional nicety: also expose the current RuntimeContainer object directly to avoid the ID lookup, but that is not necessary.",
+    "priority": "low",
+    "rationale": "This is a niche convenience function whose effect is already achievable today with existing primitives (CurrentContainerID + Networks) plus a small amount of template logic or a custom where expression, and reactivity is already supported via -event-filter. The original requester's broader use case (#149) is also resolvable with current data. Value-to-effort is modest: cheap to build but low demand, and it only saves template authors from writing a few lines or hardcoding network names. Worth doing only if the fork specifically targets multi-network/reverse-proxy isolation scenarios; otherwise skip or defer.",
+    "keyFiles": [
+      "internal/template/where.go",
+      "internal/template/template.go",
+      "internal/context/context.go",
+      "internal/generator/generator.go",
+      "cmd/docker-gen/main.go",
+      "README.md"
+    ],
+    "relatedItems": [
+      149
+    ]
+  },
+  {
+    "number": 174,
+    "title": "Check if Address.HostPort is static or dynamic?",
+    "summary": "The reporter asks how to distinguish, from within a template, between a published port declared with an explicit host port (e.g. \"5000:4000\") versus one declared with only a container port (e.g. \"4000\") where Docker assigns a random host port. In both cases the Address.HostPort field is populated with the resolved port, so the template has no way to tell whether that host port was user-specified (static) or auto-assigned (dynamic/random).",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "The limitation still exists verbatim in current code. internal/context/address.go (renderAddress + GetContainerAddresses, lines 17-50) builds each Address solely from container.NetworkSettings.Ports[port][0].HostPort, which always holds the resolved port number regardless of whether it was statically configured or randomly assigned. The Address struct (lines 7-15) has no field expressing this distinction, and there is no template function exposing it (grep for PortBindings/PublishAllPorts/Static/Dynamic in internal/context returns nothing). So a template still cannot tell \"5000:4000\" from \"4000\".",
+    "difficulty": "easy",
+    "effortEstimate": "Roughly 0.5-1 day: a few lines in address.go, one new struct field, plumb HostConfig into GetContainerAddresses, plus unit tests and a README note.",
+    "recommendedApproach": "The discriminating data is already available on the inspected container and is NOT currently consulted: container.HostConfig.PortBindings (map[Port][]PortBinding) records the host port as the user requested it. For \"5000:4000\" the entry PortBindings[\"4000/tcp\"][0].HostPort == \"5000\"; for a bare \"4000\" (random/PublishAllPorts) the requested HostPort is empty even though NetworkSettings.Ports later shows the resolved random port. So: (1) add a field to context.Address in internal/context/address.go, e.g. `HostPortStatic bool` (or expose the requested host port string, e.g. `RequestedHostPort string`); (2) change GetContainerAddresses to also receive HostConfig.PortBindings (and optionally PublishAllPorts) and, for each port, set HostPortStatic = true only when a matching PortBindings entry has a non-empty HostPort; (3) update the call site in internal/generator/generator.go (~line 456, `context.GetContainerAddresses(container)`) to pass container.HostConfig; (4) add tests in internal/context/address_test.go mirroring TestGenerateContainerAddresses, and document the new field in README.md alongside the Address struct (lines 272-280). go-dockerclient v1.13.2 (go.mod) already defines HostConfig.PortBindings and PortBinding.HostPort, so no dependency changes are needed. Templates would then use e.g. `{{ if .HostPortStatic }}`. Edge note: when network mode is host or no bindings exist the field is simply false, which is reasonable.",
+    "priority": "low",
+    "rationale": "Technically clean and low-risk to implement, but it is a niche convenience: the overwhelming use of docker-gen / nginx-proxy keys off VIRTUAL_HOST and the container's internal Port, not the host-side static/dynamic distinction. No upvotes/discussion in 10 years (zero comments, no labels) signals very low demand. Worth implementing only if the downstream fork has a concrete template that needs to special-case randomly-published ports; otherwise skip. If implemented, prefer exposing the requested host port string rather than only a boolean, since it is strictly more informative at the same cost.",
+    "keyFiles": [
+      "internal/context/address.go",
+      "internal/context/address_test.go",
+      "internal/generator/generator.go",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 180,
+    "title": "Template from URL",
+    "summary": "A user asks whether docker-gen can load its template (or config) from a remote source — e.g. fetch `10.0.0.1/templates/container1.tmpl` over HTTP — rather than reading it from a local filesystem path. It is an open-ended \"is this possible / how would I implement it\" feature question, not a bug report. The only response was a maintainer pointing at PR #192, which is unrelated and now closed.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "Against today's code the capability still does not exist. Templates are parsed exclusively from local files via text/template's ParseFiles in internal/template/template.go:182-195 (executeTemplate splits config.Template on ';' and calls newTemplate(...).ParseFiles(templatePathList...)). The template path is a plain string in config.Config.Template (internal/config/config.go:10), populated from the CLI positional arg (cmd/docker-gen/main.go:198) or from local TOML via toml.DecodeFile in loadConfig (cmd/docker-gen/main.go:95-101). Config files themselves are also only read from disk. There is no net/http usage in non-test source, and the include template func (internal/template/functions.go:31-37) and dest diffing (internal/template/template.go:162) likewise use os.ReadFile. PR #192 (the only linked discussion) is closed and concerns containers supplying templates via env vars, so this request was never addressed.",
+    "difficulty": "medium",
+    "effortEstimate": "Roughly 0.5-1 day for a minimal HTTP-fetch-at-startup version including tests and README; 2-3 days if periodic re-fetch/caching, auth headers, and TLS options are desired.",
+    "recommendedApproach": "Add a small loader that, when config.Template (and/or a config file path) has an http:// or https:// scheme, fetches the body once with net/http and writes it to a temp file, then feeds that temp path into the existing ParseFiles flow. Concretely: introduce a resolveTemplatePath(path) helper in internal/template/template.go that is called from executeTemplate before splitting on ';' (or per-element), returning a local path; for URL elements, GET the content, write to os.CreateTemp, and return the temp filename (filepath.Base is already used for the template name so a temp name is acceptable, though you may want to preserve the URL's basename). Mirror the same scheme check in cmd/docker-gen/main.go loadConfig for remote config files. Because docker-gen re-reads the template on every regeneration (GenerateFile -> executeTemplate runs on each event), naive per-event fetching would hammer the remote server, so either fetch-once-at-startup (simplest, matches the issue's \"grab the template\" intent) or add a cache/interval. Add timeouts on the http.Client, and surface errors via the existing log.Fatalf path. Keep it opt-in by scheme detection so local-path behavior is unchanged. Note: text/template requires the source available before parse, so embedding remote includes inside templates is out of scope; this only covers the top-level template/config source.",
+    "priority": "low",
+    "rationale": "It is a genuine, still-unimplemented feature with a clean implementation path, but it is a niche convenience: the documented and idiomatic pattern is to mount the template into the container (the README's nginx example uses curl/volume mounts) or to bake it into an image, both of which a downstream fork already supports for free. Remote fetching also adds operational and security surface (unauthenticated HTTP source-of-truth for generated configs, TLS/auth handling, failure-on-unreachable, fetch frequency vs. per-event regeneration). Unless the fork specifically needs centrally-served templates, the cost/benefit is poor versus a documentation note showing how to fetch the template at container start. Worth doing only if there is concrete downstream demand.",
+    "keyFiles": [
+      "internal/template/template.go",
+      "internal/config/config.go",
+      "cmd/docker-gen/main.go",
+      "internal/template/functions.go",
+      "README.md"
+    ],
+    "relatedItems": [
+      192
+    ]
+  },
+  {
+    "number": 185,
+    "difficulty": "easy",
+    "keyFiles": [
+      "internal/template/functions.go",
+      "internal/template/template.go",
+      "internal/template/functions_test.go",
+      "internal/config/config.go",
+      "internal/generator/generator.go",
+      "README.md",
+      "go.mod"
+    ],
+    "rationale": "Niche use case (PTR/reverse-DNS zone generation) from 2016 with zero upstream traction in about 9 years and no labels. Part 1 is genuinely useful and nearly free to add, so it is a reasonable low-risk addition if the fork touches DNS; otherwise skippable. Part 2 is more invasive (plumbing config into templates) for marginal benefit and should only be done on concrete demand.",
+    "recommendedApproach": "Part 1 (cheap, self-contained): add a pure-Go function to internal/template/functions.go, e.g. reverseDns(ip string) using net.ParseIP. For IPv4 produce the d.c.b.a.in-addr.arpa form and for IPv6 the nibble-reversed ip6.arpa form (mirror Go net/dnsclient reverseaddr logic). Register it in the FuncMap in internal/template/template.go near lines 64-119 and document it in the README.md function list around line 400. Add a unit test in internal/template/functions_test.go covering one IPv4 and one IPv6 case. No Docker/API surface is touched. Part 2 (optional, only if TTL-from-interval is actually wanted): thread config.Interval into templates. newTemplate currently has no config, so give executeTemplate/GenerateFile (which already receives config.Config) a way to register an interval func or expose it via the context, then add a test and README note. Recommend doing Part 1 only unless the fork specifically generates reverse-DNS zones needing a dynamic TTL.",
+    "title": "Request for template function for reversing IP addr",
+    "category": "template-function",
+    "currentRelevance": "still-relevant",
+    "priority": "low",
+    "effortEstimate": "Part 1 (reverse-IP func): about 30-60 min including test plus README. Part 2 (expose interval): about 1-2 h including plumbing decision, test, README. Combined roughly half a day.",
+    "relatedItems": [],
+    "summary": "A 2016 feature request asking for (1) a template function that converts an IP address into reverse in-addr.arpa form for generating PTR / reverse-DNS records (the user was building skydns2-based automated DNS), and (2) a follow-up question on how to read the current -interval flag value inside a template so it can be used as a DNS TTL. Neither capability exists in the current codebase.",
+    "relevanceReason": "Both gaps still exist. (1) The project uses Sprig v3.3.0 (go.mod line 7) whose only networking helper is getHostByName; it has no reverse-DNS/in-addr.arpa function, and docker-gen's own func map (registered in internal/template/template.go lines 64-119, implemented in internal/template/functions.go, documented in README.md lines 400-456) adds no IP/network helpers. So the reverse-IP function is genuinely unavailable. (2) The interval is still not reachable from templates: executeTemplate (internal/template/template.go lines 182-195) passes only the container context to the template; config.Config (which holds Interval, internal/config/config.go line 20) is available in GenerateFile (template.go line 152) and the generator loop (internal/generator/generator.go lines 146-152) but is never threaded into template data or the func map. The use case (docker-gen as a DNS/PTR generator) is niche but not obsolete.</relevanceReason>\n</invoke>\n"
+  },
+  {
+    "number": 187,
+    "title": "Add lexists function",
+    "summary": "Feature request (by mitar, May 2016) to add a template function `lexists` that checks for path existence without traversing symlinks - i.e. the os.Lstat equivalent of the existing `exists` function (which uses os.Stat and therefore follows symlinks). The use case is detecting a symlink itself even when its target is missing/dangling.",
+    "category": "template-function",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "The `exists` template func still exists today and is implemented via utils.PathExists in internal/utils/utils.go:27, which uses os.Stat (line 28) and thus follows symlinks. No `lexists`/`lstat`/symlink-aware variant exists anywhere in the code (grep for Lstat/lexists returns nothing). Sprig v3 (go.mod:7, registered in internal/template/template.go:62) does not provide an lstat/lexists function either, so the gap the requester described is unaddressed. The request is small in scope and unaffected by Docker API or swarm obsolescence since it is purely filesystem-related.",
+    "difficulty": "trivial",
+    "effortEstimate": "~30-45 minutes including test and README; roughly 15 lines of code.",
+    "recommendedApproach": "Add utils.PathLExists (os.Lstat-based) mirroring PathExists, register as \"lexists\" in template.go FuncMap, document in README after the exists entry, add a unit test (skip symlink case on Windows). See full details in approach field.",
+    "priority": "low",
+    "rationale": "Genuinely trivial and low-risk to implement, and it cleanly fills a real gap (no current way to detect a dangling symlink). But the demand is essentially zero: a single 2016 request, no comments, no labels, no thumbs-up, open for ~10 years. For a downstream fork it is only worth doing opportunistically (e.g. if someone actually needs symlink-aware checks in their templates); it should not be prioritized over functional or correctness work.",
+    "keyFiles": [
+      "C:/Users/Jam/Documents/docker-gen/internal/utils/utils.go",
+      "C:/Users/Jam/Documents/docker-gen/internal/template/template.go",
+      "C:/Users/Jam/Documents/docker-gen/internal/utils/utils_test.go",
+      "C:/Users/Jam/Documents/docker-gen/README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 197,
+    "title": "Change user permission of generated content",
+    "summary": "The reporter asks for a way to configure the owner (and by extension group/mode) of the file docker-gen generates, instead of it always being written by the user docker-gen runs as (typically root) with a fixed mode. They note the current workaround is to chown/chmod via the notifyCmd hook, but argue native ownership/permission control would be a useful security option.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "The feature still does not exist in the current code. internal/template/template.go:168 writes the destination unconditionally with os.WriteFile(config.Dest, contents, 0644) — mode is hardcoded to 0644 and ownership is whatever uid/gid the process runs as (root in the documented `-v /var/run/docker.sock` Docker setup). The Config struct in internal/config/config.go (lines 9-22) has no Owner/Group/Mode fields, and cmd/docker-gen/main.go (flags at lines 109-150, config assembly at lines 197-208) exposes no corresponding CLI flag or TOML key. README.md documents no ownership/permission control. So the underlying request is unaddressed against today's code.",
+    "difficulty": "easy",
+    "effortEstimate": "~0.5-1 day for mode-only support; ~1-2 days if owner/group (uid/gid resolution + Windows portability) is included, plus docs and tests.",
+    "recommendedApproach": "Add optional per-template fields to config.Config in internal/config/config.go, e.g. `Mode string` (octal, parsed via strconv.ParseUint(s,8,32)) and optionally `Owner`/`Group string` (resolved via os/user.Lookup -> uid/gid). Wire matching CLI flags in cmd/docker-gen/main.go (e.g. -dest-mode, -dest-owner, -dest-group) and the same TOML keys (BurntSushi/toml already decodes the struct, so adding fields is enough for config-file mode). In internal/template/template.go GenerateFile, after the os.WriteFile at line 168, apply os.Chmod(config.Dest, mode) when Mode is set and os.Chown(config.Dest, uid, gid) when owner/group is set, both guarded so default behavior (0644, current user) is unchanged. Important caveats: write a fresh-then-rename or set-perm-after-write path so the file ends with the requested mode even when it already existed; os.Chown is a no-op/error on Windows (this repo builds cross-platform — see PowerShell/win32 env), so guard owner/group with build tags or a runtime.GOOS check and document it as Unix-only. Add a generator-level test mirroring internal/generator/generator_test.go (which already exercises dest files at lines 122-137) and a template-level test like internal/template/functions_test.go:109 which already uses f.Chmod(0o644).",
+    "priority": "low",
+    "rationale": "Low effort and a clean, well-scoped change, but the value is marginal: a documented workaround already exists (chown/chmod in notifyCmd), the issue has sat open and quiet since 2016 with no upvotes or follow-up, and the typical nginx-proxy use case runs as root and reads the file as root, so output ownership rarely matters in practice. For a downstream fork it is reasonable to skip unless the fork specifically runs docker-gen unprivileged or shares the generated file with a non-root consumer; if so, implement mode-only support first (trivial) and add owner/group only if actually needed, given the Windows-portability wrinkle.",
+    "keyFiles": [
+      "internal/template/template.go",
+      "internal/config/config.go",
+      "cmd/docker-gen/main.go",
+      "internal/generator/generator_test.go",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 201,
+    "title": "docker-gen container fails with \"Unable to parse template: is a directory\" / killed with signal 2; /bin/sh -c workaround breaks signal propagation",
+    "summary": "A 2016-era issue reporting two symptoms in the old jwilder/docker-gen image: (1) startup failure \"Unable to parse template: read .../nginx.tmpl: is a directory\", and (2) the docker-gen container being killed with signal 2 (SIGINT) and not restarting. The community workaround (set entrypoint to /bin/sh -c) made docker-gen start but, as commenters noted, broke graceful shutdown and SIGHUP propagation to docker-gen (the SIGHUP was caught by sh instead).",
+    "category": "bug",
+    "currentRelevance": "already-fixed",
+    "relevanceReason": "Both symptoms are addressed in the current code and image. (1) The \"is a directory\" error is a Docker bind-mount user error (when the host template file does not exist, Docker creates an empty directory at the mount target); multiple commenters (isaldarriaga, arcticShadow) confirmed it is a compose/volume misconfiguration, not a docker-gen bug. In current code executeTemplate still does ParseFiles and log.Fatalf at internal/template/template.go:184-187, which is the correct, expected failure for a path that is a directory. (2) The \"killed with signal 2\" root cause was that Go's default SIGHUP action is os.Exit(2); the current cmd/docker-gen/main.go:166-168 explicitly does signal.Ignore(syscall.SIGHUP) before handlers are registered, and internal/generator/generator.go installs proper handlers (newSignalChannel at lines 511-515 registers SIGHUP/SIGINT/SIGTERM; SIGHUP triggers regeneration, SIGINT/SIGTERM trigger graceful shutdown at lines 113-119, 171-177, 308-317). (3) The /bin/sh -c workaround is now unnecessary and obsolete: the image entrypoint is app/docker-entrypoint.sh which ends with exec \"$@\" (line 8), so docker-gen runs in the foreground as the container's main process and receives signals directly. The README recommended run command (README.md:70) launches docker-gen directly with no sh wrapper.",
+    "difficulty": "trivial",
+    "effortEstimate": "0 days of implementation (already fixed). At most ~0.5 day if the fork wants to add a friendlier error message and/or a docs/troubleshooting note.",
+    "recommendedApproach": "Skip / close as already-fixed. The signal-handling root cause (SIGHUP -> exit code 2) is resolved by signal.Ignore(syscall.SIGHUP) in cmd/docker-gen/main.go:166-168 plus the graceful SIGINT/SIGTERM handling in internal/generator/generator.go, and the entrypoint (app/docker-entrypoint.sh exec \"$@\") ensures direct signal delivery so the /bin/sh -c workaround is no longer needed. The \"is a directory\" symptom is operator error (missing host file -> Docker creates a directory mount). Optional, low-value polish for a downstream fork: in internal/template/template.go executeTemplate, before ParseFiles, stat each path and if it is a directory emit a clearer hint (e.g. \"<path> is a directory - if you bind-mounted a template file, ensure the host file exists or Docker will create a directory at the mount target\") instead of the raw ParseFiles error at line 186. This is cosmetic and not required.",
+    "priority": "skip",
+    "rationale": "Nothing actionable remains for the fork. The substantive bug (container killed with signal 2 / broken graceful shutdown) is fixed in current code via explicit SIGHUP ignoring and dedicated signal handlers, and the entrypoint change makes the historical /bin/sh -c workaround obsolete. The remaining \"is a directory\" symptom is a user volume-mount mistake, not a code defect. Implementing the optional clearer error message is trivial but very low value, so this issue is best closed as resolved.",
+    "keyFiles": [
+      "cmd/docker-gen/main.go",
+      "internal/generator/generator.go",
+      "internal/template/template.go",
+      "app/docker-entrypoint.sh",
+      "Dockerfile.alpine",
+      "Dockerfile.debian",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 207,
+    "title": "Docker 1.12 Swarm Mode",
+    "summary": "A 2016 feature request asking docker-gen to support Docker 1.12+ \"swarm mode\" (the built-in orchestrator), which exposes services/tasks spread across multiple nodes rather than plain containers on a single daemon. Users connecting docker-gen to a swarm manager only see containers local to that node, producing broken output like `server :80;` for backends running elsewhere. The thread's only resolutions are external workarounds (socat per-node, polling, third-party rewrites), not changes to docker-gen itself.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "docker-gen still has zero swarm-mode awareness in the current tree. internal/generator/generator.go getContainers() (lines 391-509) calls only ListContainers + InspectContainerWithOptions + ListNetworks; there is no ServiceList/TaskList/NodeList anywhere in internal/. The only \"swarm\" references (context.go SwarmNode at line 125; generator.go lines 484-490 reading container.Node) are for the long-deprecated CLASSIC Swarm v1 standalone manager, not swarm mode — so the actual request remains unimplemented. The pinned client github.com/fsouza/go-dockerclient v1.13.2 (go.mod line 8) has even dropped its former swarm service/task/node methods, so the current dependency cannot list services at all.",
+    "difficulty": "hard",
+    "effortEstimate": "Multiple days to weeks (design + implementation + tests + docs). Realistically a multi-PR effort, not a weekend patch.",
+    "recommendedApproach": "Building blocks partially exist: github.com/moby/moby/client v0.4.1 (already an INDIRECT dep, go.mod line 30) exposes ServiceList, TaskList and NodeList, while the active fsouza/go-dockerclient v1.13.2 client does NOT. A real implementation would: (1) add a swarm-mode code path in internal/generator/generator.go that, when the daemon reports swarm active, calls ServiceList/TaskList/NodeList (via moby/moby/client or a fork of fsouza that still has these) instead of/in addition to ListContainers; (2) introduce a Service/Task model in internal/context/context.go (service name, labels/env from the spec, replica tasks with their node + per-task IPs, VIP, published/ingress ports) without breaking the existing RuntimeContainer template contract documented in README.md; (3) decide and document the connectivity model — a single manager endpoint can enumerate services/tasks cluster-wide, but per-task container IPs on overlay networks are only directly routable from within the swarm overlay, so templates must target the service VIP or published ingress ports rather than raw task IPs (this is the root cause of the `server :80;`/empty-IP reports in the thread); (4) handle the events gap — swarm service/task changes are NOT delivered through the /events stream that internal/generator/generator.go generateFromEvents() relies on, so swarm mode would need interval-based polling (the -interval flag in cmd/docker-gen/main.go already exists and can be reused). For a downstream fork: only worth it if multi-node swarm is a real target audience; otherwise document the supported pattern (run docker-gen per node as a global service, or use Docker's own ingress/VIP load balancing) and skip native cluster-wide support.",
+    "priority": "low",
+    "rationale": "Large, architecturally invasive feature (second client library + a whole new service/task context model + polling-based watch + template-contract additions) against a niche, aging deployment mode. Swarm mode adoption has stagnated industry-wide in favor of Kubernetes, and Docker's own swarm VIP/ingress load balancing already covers most reverse-proxy needs that docker-gen would otherwise duplicate. The existing socat/per-node workarounds in the thread are good enough for the few who need it. High cost, narrow payoff — not worth a fork's effort unless multi-node swarm is explicitly a core use case.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/context/context.go",
+      "internal/dockerclient/docker_cli.go",
+      "cmd/docker-gen/main.go",
+      "go.mod",
+      "README.md"
+    ],
+    "relatedItems": [
+      169,
+      239
+    ]
+  },
+  {
+    "number": 240,
+    "title": "How about swarm? (again)",
+    "summary": "Feature request (2017) by auzty asking docker-gen to support Docker Swarm mode by watching Swarm services (ListServices) instead of only individual containers (ListContainers), so a proxy could be configured from service-level metadata/ENV across a multi-host swarm. Follow-up commenters also asked for a way to resolve a container's multi-host overlay/swarm network IP. The issue is still OPEN with 5 thumbs-up on \"still relevant?\".",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "Nothing in the current code addresses Swarm mode. The entire pipeline is container-centric: cmd/docker-gen/main.go exposes only container flags (-container-filter, -only-exposed, etc.) and internal/generator/generator.go:getContainers() calls only Client.ListContainers + InspectContainerWithOptions, building []*context.RuntimeContainer. There is no ListServices/ListTasks/ListSwarmNodes call anywhere in the real code (grep finds them only in svc_apicheck_tmp.go, a leftover fork scratch file). The existing context.SwarmNode field (internal/context/context.go:125) is populated only from the legacy container.Node (generator.go:484), i.e. pre-1.12 classic Swarm, not Swarm-mode services. So the requested capability genuinely does not exist today. That said, the practical demand is questionable in 2026: Swarm mode is largely in maintenance mode industry-wide, and the issue has had zero activity since 2018.",
+    "difficulty": "hard",
+    "effortEstimate": "Minimal \"list services\" exposure: ~2-4 days. A genuinely useful swarm-mode integration (services + tasks + per-task overlay IPs + event/watch handling + templates + docs + tests): ~2-4 weeks.",
+    "recommendedApproach": "The dependency is no longer a blocker: go.mod pins github.com/fsouza/go-dockerclient v1.13.2, which exposes ListServices/ListServicesOptions, ListTasks, ListSwarmNodes and the swarm Service/Spec/Mode/Task types. The repo even contains a scratch file (svc_apicheck_tmp.go) that compiles those calls, and `go build ./...` passes. So the real cost is design, not API access. A concrete path: (1) Add a context.SwarmService type (Name, ID, Labels, Replicas/Global mode, published ports/VIPs, env from Spec.TaskTemplate.ContainerSpec.Env) in internal/context/context.go. (2) In internal/generator/generator.go add getServices() alongside getContainers(), calling Client.ListServices, optionally enriching with ListTasks for per-task overlay IPs (needed to answer the comment about multi-host swarm network IPs). (3) Decide how templates consume it -- either a second top-level collection passed into template.GenerateFile (invasive: template.GenerateFile and the whole []*RuntimeContainer signature in internal/template/template.go assume one container slice) or, less invasively, synthesize pseudo-RuntimeContainers from tasks so existing nginx templates keep working. (4) Add a -swarm/-services CLI flag in cmd/docker-gen/main.go and wire swarm event types (service/node/task) into the eventFilter in main.go and generator.go's AddEventListenerWithOptions. (5) Update README \"Emit Structure\" and add templates/ examples. The hard parts are the template data-model change (backward compatibility) and that docker-gen must run on a manager node and reconcile service VIP vs per-task IP semantics. For a downstream fork: only worth it if you actually deploy on Swarm; otherwise skip. Also delete the stray svc_apicheck_tmp.go either way -- it is an untracked experiment, not part of the build's purpose.",
+    "priority": "low",
+    "rationale": "High implementation cost and low/declining demand. Swarm mode adoption has shrunk dramatically since this 2017 request; the issue has been dormant since 2018 and the original use case (service ENV for nginx-proxy) is generally solved by running docker-gen as a service replica that still watches containers/tasks, or by Traefik-style native swarm providers. The change touches the core template data model (RuntimeContainer-centric pipeline) and event handling, so the risk/effort is real while the payoff for a downstream fork is marginal unless the fork specifically targets Swarm. Recommend skipping unless there is a concrete swarm deployment requirement, in which case scope it as the minimal ListServices-to-pseudo-containers approach.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/context/context.go",
+      "internal/context/address.go",
+      "internal/template/template.go",
+      "cmd/docker-gen/main.go",
+      "internal/dockerclient/docker_cli.go",
+      "go.mod",
+      "svc_apicheck_tmp.go",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 246,
+    "title": "Verbose logging",
+    "summary": "Feature request (2017) for a verbose/debug logging flag. The reporter notes docker-gen only emits \"Contents of ./output did not change. Skipping notification ''\" and gives no insight into which containers it sees or why the rendered output did not change. Comments from other users (a Synology user who can't tell why vhosts aren't detected) reinforce the diagnosability gap.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "The diagnosability gap is unchanged in current code. All logging still uses the bare standard log package with no levels (internal/generator/generator.go, internal/template/template.go, functions.go, reflect.go). cmd/docker-gen/main.go initFlags() (lines 103-163) defines no -verbose/-debug flag and there is no DEBUG env var anywhere. The exact unhelpful message the issue complains about is still emitted verbatim at internal/generator/generator.go:134 and :214. getContainers() (generator.go:391-509) discovers/inspects containers but logs nothing about which containers were found, filtered, or why output is unchanged.",
+    "difficulty": "easy",
+    "effortEstimate": "0.5-1.5 days for a basic leveled-logging implementation plus targeted debug lines; ~2-3 days if introducing a structured logging library (e.g. log/slog) and migrating all existing log.Printf call sites.",
+    "recommendedApproach": "Pragmatic minimal approach: add a -verbose bool flag (and matching DEBUG env var) in cmd/docker-gen/main.go initFlags(), thread it into config.Config, and add a small package-level debug logger (or migrate to Go's stdlib log/slog with a level set from the flag). Then add debug-level log lines at the key blind spots: (1) in getContainers()/generateFromContainers() log how many containers were listed and the names/IDs that passed vs were excluded by ContainerFilter (generator.go:124-141, 391-509); (2) in GenerateFile when contents are unchanged, optionally log a diff or at least \"rendered N containers, output identical, skipping\" instead of the current opaque message (template.go:152-180, generator.go:134/:214); (3) gate the existing high-frequency Info/Ping/event lines behind the level so default output stays clean. Prefer log/slog (Go 1.21+, repo already uses modern Go with the slices package) over a third-party dep. Keep default behavior identical to avoid breaking downstream log scrapers.",
+    "priority": "low",
+    "rationale": "Genuinely useful for operators debugging \"why isn't my vhost detected\", and technically easy/low-risk because it is purely additive. However it has sat open and unaddressed for ~9 years with no maintainer traction, indicating low upstream demand. For a downstream fork it is a nice-to-have quality-of-life improvement rather than a correctness or feature gap. Worth doing opportunistically (especially the container-discovery debug lines) but not a priority unless the fork's users are actively hitting diagnosis pain.",
+    "keyFiles": [
+      "cmd/docker-gen/main.go",
+      "internal/generator/generator.go",
+      "internal/template/template.go",
+      "internal/config/config.go",
+      "internal/template/functions.go",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 267,
+    "title": "docker-gen support detection of container creation/removal in remote nodes over a swarm?",
+    "summary": "User running a multi-node Docker Swarm reports that docker-gen only sees containers on the local host where it runs, not containers on other swarm nodes, and asks for cluster-wide visibility (including create/remove events on remote nodes). Commenters note docker-gen calls ListContainers against a single endpoint and propose getting the node list, then listing containers per node, and merging. The request is essentially \"make docker-gen Swarm-mode aware.\"",
+    "category": "swarm",
+    "currentRelevance": "likely-obsolete",
+    "relevanceReason": "The underlying single-node limitation is still 100% present in current code: internal/generator/generator.go:399 (getContainers) calls g.Client.ListContainers against one endpoint, and generateFromEvents (lines 184-322) attaches an event listener to that same single endpoint — both scoped to the local daemon. So the complaint remains technically accurate. However the request is effectively obsolete as framed: (1) the SwarmNode struct (internal/context/context.go:125) and the container.Node population (generator.go:484-490) are vestiges of legacy standalone/\"classic\" Swarm (pre-1.12), where one manager endpoint proxied all nodes — modern Swarm mode never populates container.Node on inspect; (2) the pinned dependency github.com/fsouza/go-dockerclient v1.13.2 contains NO swarm-mode API at all (no swarm.go/service.go/node.go/task.go and no ListServices/ListNodes/ListTasks/InspectService methods — verified in the module cache), so the commenters' \"list nodes, then list each node's containers, then merge\" approach is not implementable with the current dependency; and (3) Docker exposes no API to enumerate a remote node's *local containers* from a manager — cluster workload state is only available via the swarm tasks/services API, which docker-gen does not consume. docker-gen's whole data model (RuntimeContainer with per-container networks, env, IP, mounts from InspectContainer) is built around individual containers on the local daemon, not swarm services/tasks.",
+    "difficulty": "hard",
+    "effortEstimate": "Weeks. Realistically a multi-month design effort if done properly.",
+    "recommendedApproach": "Recommend SKIP for the fork. There is no small, correct fix. A real implementation would require either: (a) adding a full Swarm-mode data path — bump/replace go-dockerclient to a client that exposes ListServices/ListTasks/ListNodes (the docker/docker official SDK does), introduce new template context types (Service/Task/Node) alongside RuntimeContainer, watch swarm-scoped events, and resolve task->node->VIP/endpoint addressing — which is a large new feature touching internal/generator/generator.go, internal/context/context.go, internal/template/*, and the README template docs; or (b) the deployment-level workaround that the ecosystem actually settled on: run one docker-gen per node (global service / DaemonSet-style) each watching its own local socket, or use the swarm-native sidecars/labels approach (e.g. nginx-proxy's documented swarm guidance and third-party images like the one linked in the thread). The cluster-wide create/remove *event* requirement is especially poorly served by docker-gen's model because Docker does not stream another node's container lifecycle events to a manager. If the fork has a genuine swarm use case, prefer (b) the per-node deployment pattern over modifying docker-gen core. Note also that the legacy classic-Swarm remnants (context.SwarmNode + generator.go Node handling + the README \"Node\" example with the old AAAA:BBBB node-id format) are dead weight worth a separate cleanup, independent of this issue.",
+    "priority": "skip",
+    "rationale": "High implementation cost (new dependency, new template data model, new event handling, addressing semantics) against an old (2017) request that the upstream community never merged and effectively routed around with deployment patterns and third-party swarm images. docker-gen's container-centric design fundamentally mismatches swarm's service/task model, and the pinned go-dockerclient cannot even express the swarm API. The proven workaround (per-node docker-gen instances) requires zero code changes. Not worth fork effort; better spent on the bundled use case (nginx-proxy) which is single-host.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/context/context.go",
+      "internal/dockerclient/docker_cli.go",
+      "go.mod",
+      "README.md"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 269,
+    "title": "Excessive calls to '/events' api if docker daemon is not fully initialized",
+    "summary": "Reported in Jan 2018: when the Docker daemon (Docker 1.9.1) is not fully initialized, docker-gen hammers the Docker API's /events endpoint hundreds-to-thousands of times per second, driving daemon memory from ~40MB to 4GB+. It is effectively a tight reconnect/retry loop on the event stream with insufficient backoff. No discussion comments; never triaged.",
+    "category": "bug",
+    "currentRelevance": "already-fixed",
+    "relevanceReason": "Two independent layers now bound the reconnect rate. (1) docker-gen's own event loop in internal/generator/generator.go (lines 225-321) sleeps time.Sleep(10*time.Second) on every failure path: connection interrupted (line 288), listener registration error (line 263), bad endpoint / connect failure (lines 239, 246), and pings for daemon liveness every 10s (line 297). I verified via the GitHub API that this 10s backoff already existed at the time of the report (mid-2016 generator.go, commit 2b03a4e3), so the original flood originated inside the go-dockerclient library, not docker-gen's outer loop. (2) The project now pins fsouza/go-dockerclient v1.13.2 (go.mod), whose event.go adds connectWithRetry with exponential backoff (retryInitialWaitTime=10ms, 2^retries, maxMonitorConnRetries=5; event.go:291-311), an EOFEvent sentinel, and a noListeners guard preventing goroutine leaks. The reporter's environment (Docker 1.9.1) is a decade-obsolete API. A GitHub issue search for events/memory/daemon turns up zero follow-up reports, indicating the symptom has not recurred.",
+    "difficulty": "unknown",
+    "effortEstimate": "~0.5-1 day IF a hardening change is desired (add jittered exponential backoff + a configurable retry interval); 0 days to close as already-fixed/obsolete.",
+    "recommendedApproach": "Recommend closing as already-fixed/obsolete for the fork: the symptom (Docker 1.9.1, library with no backoff) cannot reproduce against today's code (v1.13.2 + the existing 10s loop-level backoff). If the fork wants belt-and-suspenders hardening, the only residual theoretical gap is in the library's monitorEvents re-spawn: a non-EOF stream decode error triggers `go eventState.monitorEvents(...)` and if the socket connect keeps succeeding while the stream immediately errors, connectWithRetry returns success with no inter-respawn backoff. docker-gen's own 10s sleep on the resulting channel-close (generator.go:288) already bounds this to ~once/10s in practice. A minimal hardening change would be: (a) replace the four hardcoded 10*time.Second sleeps in generator.go with exponential backoff + jitter (cap ~60s) that resets on a successful event, and (b) expose it as a configurable flag in internal/config/config.go. No change to the vendored library is needed. Note: the library's EOFEvent sentinel is intercepted inside monitorEvents and never reaches docker-gen's eventChan, so the event.Actor.ID[:12] access at generator.go:292 is not a panic risk for the EOF path.",
+    "priority": "skip",
+    "rationale": "The reported memory blowup is not reproducible against current code: docker-gen's outer loop has had a 10s reconnect backoff since at least 2016, and the modern go-dockerclient v1.13.2 adds its own exponential-backoff connectWithRetry plus listener-leak guards. The trigger environment (Docker 1.9.1) is long obsolete and no equivalent issue has been filed in the years since. Any remaining work is optional hardening (jittered backoff + configurable interval), not a fix for a live bug, so it is low value for the fork.",
+    "keyFiles": [
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\generator\\generator.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\dockerclient\\docker_cli.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\internal\\config\\config.go",
+      "C:\\Users\\Jam\\Documents\\docker-gen\\go.mod"
+    ],
+    "relatedItems": []
+  },
+  {
+    "number": 330,
+    "title": "Add image label info",
+    "summary": "Feature request to expose a container's underlying Docker image labels (set via Dockerfile LABEL) to templates, so image authors can ship sensible defaults (e.g. caddy-gen's virtual.port) that users don't have to repeat on every container. The author also floats exposing image-declared ports as a secondary, harder idea. No comments, no maintainer response, still OPEN since 2020.",
+    "category": "feature-request",
+    "currentRelevance": "still-relevant",
+    "relevanceReason": "The data model is unchanged since the issue was filed. internal/context/context.go RuntimeContainer (lines 83-102) still exposes only container Labels (map[string]string) and an Image struct (DockerImage at lines 108-112) that holds only Registry/Repository/Tag strings — no image labels, no image-declared ports. internal/generator/generator.go line 504 sets runtimeContainer.Labels = container.Config.Labels (container labels only) and never calls InspectImage. No merged/closed PR addresses it (PR #303 'Add Labels to SwarmNode' and #239 'Swarm mode' are unrelated). The use case (image-author-provided label defaults) is still valid.",
+    "difficulty": "easy",
+    "effortEstimate": "0.5-1.5 days including tests and docs; core wiring is a few hours",
+    "recommendedApproach": "The vendored client github.com/fsouza/go-dockerclient v1.13.2 fully supports this with no API-version risk: Container.Image (container.go:416) holds the resolved image ID, Client.InspectImage(name) exists (image.go:204), and the returned Image.Config.Labels (Config.Labels at image.go:31) carries the Dockerfile LABELs. Concrete steps: (1) Add a field to context.DockerImage in internal/context/context.go, e.g. Labels map[string]string (keep image labels separate from container Labels to avoid silently shadowing user intent; let templates merge explicitly if desired). (2) In internal/generator/generator.go getContainers (~lines 420-504), after InspectContainerWithOptions, call img, err := g.Client.InspectImage(container.Image); on success populate runtimeContainer.Image.Labels = img.Config.Labels (guard nil Config). (3) Cache InspectImage results by image ID inside getContainers so N containers sharing an image trigger one API call per regeneration — important since getContainers runs on every event/interval. (4) Update README.md Emit Structure (DockerImage struct shown at lines 295-299) and add an example showing default-from-image-label plus a coalesce/groupByLabel-style usage. (5) Add tests mirroring internal/generator/generator_test.go and internal/context/context_test.go. Skip the exposed-ports sub-request for now — it is genuinely fuzzier (multi-port ambiguity, the author flagged it himself) and the label half delivers the core value.",
+    "priority": "low",
+    "rationale": "Technically clean and low-risk, but downstream value is marginal for a generic fork: the same default-from-label behavior can already be achieved today at the template layer (coalesce plus a documented label) or by the image setting an ENV that docker-gen already exposes via Env. The benefit is purely convenience for image authors, the original requester never opened a PR, and it adds a per-container API call that must be cached to avoid a performance regression. Worth doing only if your fork specifically targets the caddy-gen/nginx-proxy 'image ships its own defaults' UX; otherwise defer.",
+    "keyFiles": [
+      "internal/context/context.go",
+      "internal/generator/generator.go",
+      "internal/dockerclient/docker_cli.go",
+      "README.md",
+      "internal/generator/generator_test.go",
+      "internal/context/context_test.go"
+    ],
+    "relatedItems": [
+      303,
+      239
+    ]
+  }
+]

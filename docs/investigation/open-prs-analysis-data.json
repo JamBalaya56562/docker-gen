@@ -1,0 +1,202 @@
+[
+  {
+    "number": 202,
+    "title": "Handle kill event",
+    "author": "dustinblackman",
+    "summary": "Adds a `Killing` boolean to the container `State` struct that flips to true when Docker emits a `kill` event (which fires on `docker stop`), so that templates can treat a container as already-gone during its graceful-shutdown drain window. The motivating use case is nginx-proxy load balancing: when a container is shutting down, it is immediately removed from the generated nginx config (stopping new requests) while the app keeps existing connections alive until SIGTERM completes. Implemented by whitelisting the `kill` event for fan-out, tagging the matching container by ID as Killing in the consumer loop, and excluding killing containers from `filterRunning`.",
+    "category": "feature",
+    "currentStatus": "obsolete",
+    "difficulty": "medium",
+    "effortEstimate": "~half day",
+    "recommendedAction": "reimplement",
+    "priority": "low",
+    "conflictAssessment": "All three touched files were root-level (context.go, generator.go, template.go) and no longer exist; code moved under internal/. More importantly the PR's wiring points are gone: (1) the per-config consumer loop in internal/generator/generator.go:206 is now `for range debouncedChan` and ignores the event entirely (it just re-lists containers from the Docker API), whereas the PR depended on reading `event.Status == \"kill\"` and `event.ID` in that loop; (2) newDebounceChannel (generator.go:517-557) collapses many events into one and discards per-event identity, so there is no per-event hook left; (3) the event-status whitelist the PR amended is gone — current code fans out ALL events (generator.go:292-296), making the `\"kill\"` addition moot; (4) filterRunning no longer exists in internal/template/template.go, and `Running` is set in getContainers (generator.go:436) but never read by any template code, so the PR's filter hook is absent.",
+    "rationale": "The literal diff cannot be rebased — every integration point it relied on was removed or restructured during the internal/ reorganization. Adding `Killing bool` to the State struct (internal/context/context.go:74) and to the constructor (internal/generator/generator.go:435) is trivial, but the hard part is that the current consumer loop (internal/generator/generator.go:206) no longer sees individual events and the kill state is NOT recoverable from a Docker API re-list (docker inspect has no \"killing\" concept). A faithful reimplementation would need to thread per-container kill state from the event-fanout goroutine (generator.go:271-296) into the per-config consumers and have it survive the getContainers() re-list — meaningfully more involved than the original ~15-line patch. There is also no template-side consumer of Running today, so the fork would additionally need to decide how killing containers are surfaced to templates (a `where`/filter helper or doc'd field) since the old filterRunning is gone. Value is niche (graceful-drain for nginx-proxy) and the upstream PR sat unanswered since 2016, so it is low priority unless the fork specifically needs zero-downtime connection draining.",
+    "keyFiles": [
+      "internal/context/context.go",
+      "internal/generator/generator.go",
+      "internal/template/template.go",
+      "internal/template/where.go"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "number": 247,
+    "title": "Add support for notifying a service",
+    "author": "njdancer (Nick Dancer)",
+    "summary": "Adds a `-service-notify-sighup <serviceID>` CLI flag and a `NotifyServices map[string]docker.Signal` config field so docker-gen can HUP every container backing a Docker Swarm service. Implementation lists the service's tasks via `g.Client.ListTasks(ListTasksOptions{Filters:{\"service\":[id]}})`, reads each task's `Status.ContainerStatus.ContainerID`, and kills it with SIGHUP. The (empty-body, 2017) PR also incidentally migrated `SetServerInfo` from `*docker.Env` to `*docker.DockerInfo` and bumped the go-dockerclient pin. A 2023 commenter (k3a) reports it works and suggests skipping non-running tasks and improving the log message.",
+    "category": "feature",
+    "currentStatus": "obsolete",
+    "difficulty": "medium",
+    "effortEstimate": "~half day (reimplement via swarm labels); ~few days if a swarm-capable docker client must be reintroduced",
+    "recommendedAction": "reimplement",
+    "priority": "low",
+    "conflictAssessment": "Marked CONFLICTING/DIRTY by GitHub, but the real problem is deeper than text conflicts. (1) The Swarm management API the PR depends on no longer exists in the pinned dependency: github.com/fsouza/go-dockerclient v1.13.2 has no ListTasks, ListTasksOptions, Task, or ContainerStatus (confirmed by grepping the module cache at C:/Users/Jam/go/pkg/mod/github.com/fsouza/go-dockerclient@v1.13.2 — only SwarmNode and a SwarmInfo struct remain, and misc.go:117 marks even that 'Deprecated: Docker Swarm is deprecated'). So g.Client.ListTasks(...) and task.Status.ContainerStatus.ContainerID will not compile. (2) The PR's context.go change (SetServerInfo *docker.Env -> *docker.DockerInfo) is already done upstream in internal/context/context.go:33, so that half is redundant. (3) Config shape diverged: internal/config/config.go now uses NotifyContainers map[string]int (not docker.Signal), so the PR's NotifyServices map[string]docker.Signal pattern no longer matches. (4) main.go and generator.go moved to cmd/docker-gen and internal/generator and were heavily refactored (per-config signal helpers added).",
+    "rationale": "The feature idea (notify all containers of a swarm service on regen) is reasonable, but the PR as written is dead against the current tree because its core dependency dropped the Swarm task API (internal/generator/generator.go imports fsouza/go-dockerclient v1.13.2 per go.mod, which lacks ListTasks). It cannot be rebased — only reimplemented. Crucially, the current code already offers most of the value through a different, working mechanism: internal/generator/generator.go:373 sendSignalToFilteredContainers + the -notify-filter flag (cmd/docker-gen/main.go:137) let users signal containers by label/name filter today, and swarm tasks expose the label com.docker.swarm.service.name. So a downstream fork can already do `-notify-filter label=com.docker.swarm.service.name=<svc>` without any code change for the local-node case. A dedicated -service-notify flag would mainly add ergonomics; cross-node task enumeration would require reintroducing a swarm-capable client (large, and upstream has deprecated swarm). The 2017 PR has an empty body, sat 6+ years, and only superficial engagement.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/config/config.go",
+      "cmd/docker-gen/main.go",
+      "internal/context/context.go",
+      "go.mod"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "number": 254,
+    "title": "Add ability to use pongo2 as an alternative to Go Template",
+    "author": "fdintino",
+    "summary": "Adds pongo2 (a Django/Jinja2-style Go template engine) as an optional alternative to Go's text/template, selectable via a new -engine CLI flag (\"go\" default or \"pongo2\") or engine = \"pongo2\" in a TOML config block. It introduces a pongoContext() helper that maps docker-gen's template functions into a pongo2.Context (using a pongoWrap reflection shim to adapt funcs that return errors), branches executeTemplate on the engine, adds an Engine field to the Config struct, and ports the example templates (nginx, etcd, fluentd, logrotate, dnsmasq) to pongo2 syntax. The author states it is a proposal to gauge interest, with no tests or documentation written yet.",
+    "category": "feature",
+    "currentStatus": "obsolete",
+    "conflictAssessment": "The PR targets the 2017 flat layout (top-level config.go, template.go, cmd/docker-gen/main.go) and dependency tooling (GLOCKFILE/glock) that no longer exist. The code now lives under internal/ (internal/config/config.go, internal/template/template.go, internal/context/context.go) and uses Go modules (go.mod/go.sum, go 1.25.5). Every hunk fails to apply. Beyond mechanical conflicts, the pongoContext() function map is semantically stale: the current Go funcmap in internal/template/template.go has diverged heavily (Sprig integration plus sprig* aliases, eval/include closures, fromYaml/toYaml, whereNot, groupByWithDefault, groupByLabelWithDefault, sortStrings*/sortObjects*, comment, toLower/toUpper), none of which exist in the PR's hardcoded pongo map. Also Context.Env and Context.Docker are now methods (internal/context/context.go), not the values the PR's pongo map assumes, and executeTemplate now supports multi-file templates via ';'-split ParseFiles, which the pongo branch does not handle.",
+    "difficulty": "hard",
+    "effortEstimate": "~few days",
+    "recommendedAction": "reimplement",
+    "priority": "low",
+    "rationale": "The diff cannot be rebased: it predates the entire internal/ reorganization and the move from GLOCKFILE to Go modules, so nothing applies cleanly. More importantly the design is now incompatible — the PR hardcodes a pongo2 function map and context shape that has fully diverged from the current internal/template/template.go (Sprig funcs and sprig* aliases, eval/include closures, fromYaml/toYaml, whereNot, groupByWithDefault, sort* funcs) and from internal/context/context.go (Env/Docker are now methods, not fields). Delivering a usable pongo2 engine today means re-deriving the function map, adapting it to current signatures in internal/template/where.go and internal/template/groupby.go, handling the multi-template ParseFiles path, threading an Engine field through internal/config/config.go and cmd/docker-gen/main.go, and writing the tests/docs the author never wrote. That is effectively a fresh feature, not a finish-the-PR job. Strategically it is also a large, permanent maintenance burden: a second templating language to keep at parity, plus a new dependency (flosch/pongo2). The original maintainer (jwilder) said 'I like it' in 2017 but never tested or merged, and it has sat untouched since; for a downstream fork the cost/benefit is poor unless Jinja2 syntax is a hard requirement. Recommend reimplement only if there is concrete downstream demand; otherwise close.",
+    "keyFiles": [
+      "internal/template/template.go",
+      "internal/config/config.go",
+      "cmd/docker-gen/main.go",
+      "internal/context/context.go",
+      "internal/template/where.go",
+      "internal/template/groupby.go",
+      "go.mod"
+    ],
+    "relatedIssues": [
+      177
+    ]
+  },
+  {
+    "number": 319,
+    "title": "two new functions splitKeyValuePairs and groupByMultiKeyValuePairs",
+    "author": "BobSilent (Andre Mainka)",
+    "summary": "Adds two template helper functions. splitKeyValuePairs($string, $listSep, $kvpSep, [$defaultKey]) splits a string into a map[string]string by first splitting on $listSep into items, then each item on $kvpSep into key/value; items lacking the kvp separator fall back to $defaultKey (or use the whole item as both key and value). groupByMultiKeyValuePairs is like groupByMulti but parses the field value into key/value pairs and groups containers by the keys. Includes README docs and unit tests. The stated use case is parsing env vars like VIRTUAL_PORT=\"443:3000,3000:3000\".",
+    "category": "template-function",
+    "currentStatus": "conflicting",
+    "difficulty": "easy",
+    "effortEstimate": "~1-2h",
+    "recommendedAction": "reimplement",
+    "priority": "low",
+    "conflictAssessment": "The PR (2020, last touched 2023) edits the old monolithic root-level template.go and template_test.go, which no longer exist. The code was reorganized: the groupBy* family now lives in internal/template/groupby.go, the FuncMap registration in internal/template/template.go (newTemplate), and tests in internal/template/groupby_test.go. The FuncMap block the PR rewrites was completely restructured (it now chains sprig.TxtFuncMap() and uses struct-literal entries), so the PR's column-realignment diff is pure noise and cannot apply. RuntimeContainer moved to internal/context and tests switched to testify/assert. Net: the patch is entirely conflicting and will not rebase; it must be re-applied by hand.",
+    "rationale": "The two functions have no equivalent in the current codebase: internal/template/groupby.go has groupByMulti (line 39) which splits a field value into plain strings, but nothing parses key/value pairs or groups by the key half; sprig (imported in internal/template/template.go) offers no direct kv-grouping helper either, so the idea still applies. Reimplementation is small and mechanical: add splitKeyValuePairs + groupByMultiKeyValuePairs to internal/template/groupby.go (reuse the existing generalizedGroupByKey at groupby.go:32), register both in the newTemplate FuncMap at internal/template/template.go:64-119, add a groupby_test.go test using *context.RuntimeContainer + testify/assert (matching the existing style at groupby_test.go:10-45 rather than the PR's hand-rolled t.Fatalf), and add two README.md bullets near lines 411 and 448. Two quality fixes should be made when porting: the PR uses strings.Split(kvp, kvpSep) and indexes [0]/[1], silently dropping extra segments when a value contains the separator (use strings.SplitN(..., 2)); and the PR's test casts to value type RuntimeContainer while entries are pointers (groups[\"445\"][1].(RuntimeContainer)), which would panic against current code. Priority is low: this is a niche convenience helper with no linked issue and a narrow use case; the fork should adopt it only if a template actually needs kv-keyed grouping.",
+    "keyFiles": [
+      "internal/template/groupby.go",
+      "internal/template/template.go",
+      "internal/template/groupby_test.go",
+      "README.md"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "title": "Trivial implementation of automated schema/user creation - just good enough for dev",
+    "number": 462,
+    "author": "phil-lello-gb (Phil Lello)",
+    "summary": "Adds three new standalone example files under templates/: mariadb.tmpl (a docker-gen template that, for each container exposing DB_HOST/DB_USER/DB_PASS/DB_SCHEMA env vars, emits mysql commands to CREATE USER, CREATE SCHEMA and GRANT privileges), mariadb.dockerfile (builds a mariadb image with docker-gen copied in), and mariadb-entrypoint.sh (runs docker-gen then loops on docker-gen --watch, sourcing the generated SQL script). It is a usage/example contribution demonstrating automated DB provisioning from container metadata; it changes no Go code. The author explicitly describes it as \"just good enough for dev.\"",
+    "category": "docs",
+    "currentStatus": "mergeable",
+    "conflictAssessment": "GitHub reports the PR as MERGEABLE against main. It only adds 3 brand-new files to templates/ (28 additions, 0 deletions) and touches no Go source, so there is no code-level conflict with the internal/template, internal/context, internal/generator reorganization. The template syntax it uses (range $index, $value := . and $value.Env.DB_HOST) is identical to the pattern still used by the current templates/nginx.tmpl, so it would still render under today's template engine.",
+    "difficulty": "trivial",
+    "effortEstimate": "~30min if adopted (mostly cleanup), 0 if closed",
+    "recommendedAction": "close",
+    "priority": "skip",
+    "rationale": "This is a low-value example/docs contribution, not a feature or fix. It adds no functionality to docker-gen itself and is self-described as \"just good enough for dev.\" For a downstream fork there is essentially nothing to gain: the idea (use docker-gen to template SQL provisioning) already works today with no code changes, since the example relies only on $value.Env.* iteration that the current engine still supports (same pattern as templates/nginx.tmpl). The example also has real quality problems that make it unsuitable to ship as-is: mariadb.dockerfile pulls FROM jwilder/docker-gen, the abandoned upstream image, whereas the project now publishes nginxproxy/docker-gen (README line 70); mariadb-entrypoint.sh runs an unbounded while true loop that repeatedly invokes docker-gen --watch with no sleep/backoff; and both the script and mariadb.tmpl hardcode a password (-ppass) and carry a # TODO. None of the new files are wired into README or tests, so they would sit as orphaned artifacts. Rebasing is effortless (it is already mergeable) but not worth it — if the fork wanted such an example it would be faster to author a clean one than to adopt and fix this one. Recommend close (or ignore).",
+    "keyFiles": [
+      "templates/nginx.tmpl",
+      "templates/etcd.tmpl",
+      "README.md",
+      "internal/template/template.go",
+      "internal/context/context.go"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "number": 548,
+    "title": "Add support to pull data from multiple docker endpoints (e.g. swarm)",
+    "author": "tarasov65536 (Dmitriy Tarasov)",
+    "summary": "Adds a repeatable `-swarm-node` flag so docker-gen can aggregate container/network metadata from multiple Docker API endpoints (one per Swarm node) instead of only the local socket. NewGenerator builds one *docker.Client per swarm node (defaulting to the single endpoint when none given); generateFromEvents is rewritten to run a per-endpoint event-watcher goroutine that fans events into a central channel, and getContainers loops over all swarm clients to collect containers. Control actions (sendSignalToContainer, SetServerInfo, SetDockerEnv) intentionally stay on the single local g.Client. Author runs it in production and offers to redo the PR cleanly.",
+    "category": "feature",
+    "currentStatus": "conflicting",
+    "difficulty": "hard",
+    "effortEstimate": "~few days",
+    "recommendedAction": "reimplement",
+    "priority": "medium",
+    "rationale": "The feature idea still applies and the author's core design assumption holds in current code: sendSignalToContainer (internal/generator/generator.go:344), sendSignalToFilteredContainers (:373) and SetServerInfo/SetDockerEnv all operate on the single local g.Client, so aggregating read-only data from multiple endpoints while keeping control actions local is sound today. However, the PR (opened 2023-08, base predates the container-filter rework) is CONFLICTING/DIRTY and cannot be textually rebased. Two hard blockers: (1) getContainers was changed to func (g *generator) getContainers(config config.Config) and now drives inclusion via config.ContainerFilter passed to ListContainers (generator.go:391-403); the PR fully rewrites getContainers using a now-deleted g.All field and no per-config filter, so adopting it would regress the container-filter/include-stopped/only-exposed feature. The generator struct (generator.go:22-33) and GeneratorConfig (:35-46) no longer have an All field at all, so the PR will not even compile. (2) The PR's generateFromEvents rewrite (per-endpoint goroutines + eventChan/done/clientDone orchestration, replacing the eventChan<-nil resync trick) must be hand-reapplied onto the current single-client loop (generator.go:184-322), which is concurrency-sensitive and easy to get subtly wrong (the PR's clientDone/done channels are unbuffered and written from multiple goroutines). The supporting pieces it needs already exist: dockerclient.GetEndpoint and NewDockerClient (internal/dockerclient/docker_cli.go:14,32) are unchanged, and the main.go flag plumbing (cmd/docker-gen/main.go:103-163, 244-252) is a trivial addition. Net: small, well-scoped concept but the implementation must be rewritten against current generator.go rather than merged. The author has offered to do exactly this, which lowers our cost considerably.",
+    "conflictAssessment": "CONFLICTING / mergeStateStatus DIRTY. The two files that diverged most are internal/generator/generator.go and internal/generator/generator_test.go. getContainers was refactored to take config.Config and use config.ContainerFilter (the container-filter feature), whereas the PR rewrites getContainers around the deleted g.All field and a multi-client loop — a direct semantic conflict, not just textual. The generator/GeneratorConfig structs dropped the All field the PR depends on, so the PR no longer compiles against main. generateFromEvents is still structurally similar to the PR's 'before' side, so that part is re-appliable but must be merged by hand. README and cmd/docker-gen/main.go changes are trivial and conflict-free in spirit.",
+    "keyFiles": [
+      "internal/generator/generator.go",
+      "internal/generator/generator_test.go",
+      "cmd/docker-gen/main.go",
+      "internal/dockerclient/docker_cli.go",
+      "README.md"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "number": 596,
+    "title": "feat: Add WASM module templates",
+    "author": "asmfreak (Pavel Pletenev)",
+    "summary": "Adds the ability to use a compiled WebAssembly (WASI) module as a \"template\" instead of a Go text/template file. If the template path ends in .wasm, docker-gen runs it via the tetratelabs/wazero runtime: it JSON-serializes the container context to the module's stdin and captures stdout as the rendered output. It introduces a new public `plugin` Go module (separate go.mod) that WASM authors import to parse input and emit output, ships easyjson-generated marshalling code, mirrored struct definitions, a generalized GroupBy helper, a worked nginx example (with a committed .wasm binary), a `-wasmcache`/`WASM_CACHE_DIR` flag for the wazero compilation cache, and a multi-module go.work workspace.",
+    "category": "feature",
+    "currentStatus": "conflicting",
+    "difficulty": "hard",
+    "effortEstimate": "~few days",
+    "recommendedAction": "needs-discussion",
+    "priority": "low",
+    "rationale": "The core idea still applies and the integration seam is small: the only change to docker-gen's own runtime code is in internal/template/template.go GenerateFile, branching to executeWasm when filepath.Ext(config.Template)==\".wasm\". The current GenerateFile (internal/template/template.go:152-180) calls executeTemplate(config.Template, containers) directly and has none of the filteredContainers/filteredRunningContainers block the PR's hunk expects, so that hunk will not apply — but re-pointing the one-line branch is trivial. Crucially there is NO struct drift: internal/context/context.go still defines RuntimeContainer, Network, State, Health, Address, Volume, Mount, SwarmNode, DockerImage, Docker with exactly the fields the PR's wasm.go converters (pluginRuntimeContainer et al.) read, so internal/template/wasm.go would still compile against current context types. What makes this HARD is everything around it, not the seam: (1) the dependency/build changes are fully stale — current go.mod is now Go 1.25.5 with refreshed deps (go-dockerclient 1.13.2, sprig 3.3.0, BurntSushi/toml 1.6.0), while the PR pins go 1.21 and adds wazero 1.6.0 + easyjson 0.7.7 + a go.work/go.work.sum that must all be regenerated from scratch; (2) it adds a whole new versioned public `plugin/` module (separate go.mod) plus 1385 lines of committed easyjson-generated code and a duplicated set of structs that must be hand-kept in sync with internal/context forever — a real maintenance burden and the most likely reason maintainers would balk; (3) it commits a binary .wasm artifact into examples/, which needs a tinygo build step in CI instead; (4) error handling uses log.Fatalf/log.Panicf rather than returning errors, inconsistent with how executeTemplate is structured. The PR is from Feb 2024, has zero review comments, no linked issue, and is marked CONFLICTING/DIRTY. For a downstream fork the value depends entirely on whether WASM plugins are actually wanted; if so, reimplementing the small wazero call-site against current code is cleaner than rebasing the stale multi-module/easyjson machinery.",
+    "conflictAssessment": "Marked mergeable=CONFLICTING / mergeStateStatus=DIRTY by GitHub. Concrete divergences in current local code: go.mod moved from go 1.21 to go 1.25.5 with a fully refreshed dependency set, so the PR's go.mod/go.sum/go.work/go.work.sum additions (wazero, easyjson, intern) are obsolete and must be regenerated. The README options block the PR edits has since been rewritten. The internal/template/template.go GenerateFile hunk targets a filteredContainers block that no longer exists (current code at internal/template/template.go:152 calls executeTemplate directly). No plugin/ directory or go.work exists locally yet. The internal/context structs, however, have NOT drifted, so the conversion logic itself remains valid.",
+    "keyFiles": [
+      "internal/template/template.go",
+      "internal/context/context.go",
+      "cmd/docker-gen/main.go",
+      "go.mod",
+      "go.sum",
+      "README.md"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "title": "feat: Adding new Notify Option using exec",
+    "number": 713,
+    "author": "Ozymandias88 (Christopher Lake)",
+    "summary": "Adds a new `NotifyContainersCmd` config option (a map of container name/ID to a command argv slice) that, after a template is regenerated, runs the given command INSIDE the target container via the Docker exec API (CreateExec/StartExec/InspectExec), logging stdout and exit code. This complements the existing signal-based notifications (NotifyContainers / NotifyContainersFilter) for cases where the target needs a real command run rather than a Unix signal (the motivating example is `pihole reloaddns`). The change touches internal/config/config.go (one struct field), internal/generator/generator.go (a new sendCmdToContainers method, +50 lines), and README.md (docs).",
+    "category": "feature",
+    "currentStatus": "mergeable",
+    "difficulty": "easy",
+    "effortEstimate": "~1-2h (to adopt + add missing call sites + a test)",
+    "recommendedAction": "rebase-and-finish",
+    "priority": "medium",
+    "conflictAssessment": "Not conflicting. GitHub reports mergeable=MERGEABLE (mergeStateStatus=BLOCKED is a required-check/review gate, not a code conflict). The PR is recent (2025-11-26) and was written against the current reorganized layout (internal/config, internal/generator), so the diff applies cleanly to current local code: the struct insertion point at internal/config/config.go:16-19 matches, and the generator anchors (the notify-call block and sendSignalToFilteredContainers) match internal/generator/generator.go exactly.",
+    "rationale": "The idea is sound and fills a real gap: today docker-gen can only signal containers (sendSignalToContainer/KillContainer in internal/generator/generator.go:344-389) or run a host-side shell command (runNotifyCmd, generator.go:324-342). There is no way to run a command inside another container, which some targets (e.g. pihole) require. The implementation is small, idiomatic, and uses go-dockerclient's stable exec API (CreateExec/StartExec/InspectExec); the dependency in go.mod is fsouza/go-dockerclient v1.13.2, which has supported these for years. Config wiring is free: cmd/docker-gen/main.go:95-101 decodes TOML straight into config.Config via toml.DecodeFile, and there is no CLI flag for the existing NotifyContainersFilter either, so a config-file-only option is consistent with current conventions. HOWEVER, there is a genuine incompleteness to fix before merging: the new g.sendCmdToContainers(cfg) is only wired into generateFromEvents (generator.go:~218). Every existing notify mechanism is also invoked from generateFromContainers (generator.go:137-139) and generateAtInterval (generator.go:168-170). As written, the new command would NOT fire on initial/startup generation or on interval-based generation -- only on watched Docker events. Adding the two missing call sites is trivial. Minor nits: Tty:true + RawTerminal:true plus a non-thread-safe bytes.Buffer is slightly odd for capturing output (signal handling already uses simple patterns); and there are no unit tests for the new path, though the existing generator has little test coverage either. For a downstream fork this is a low-risk, low-effort, genuinely useful feature -- adopt it, add the missing call sites, and optionally a smoke test.",
+    "keyFiles": [
+      "internal/config/config.go",
+      "internal/generator/generator.go",
+      "cmd/docker-gen/main.go",
+      "README.md"
+    ],
+    "relatedIssues": []
+  },
+  {
+    "number": 718,
+    "title": "Add swarm service",
+    "author": "anmorel",
+    "summary": "Adds Docker Swarm *service* enumeration to docker-gen so templates can iterate over services (not just containers). It introduces a RuntimeService type plus a package-level dockerService store with a Service() accessor and SetServices() setter in internal/context/context.go, a getServices() method in internal/generator/generator.go that calls Client.ListServices() and maps swarm.Service fields (Name, ID, Labels, State, EndpointMode, Mode, Replicas) into RuntimeService, wiring SetServices() into the container/interval/event generation paths, and a demo templates/services.tmpl. Templates access the data via .Service. It is a small, self-contained feature (+120/-3, 3 files, single commit).",
+    "category": "feature",
+    "currentStatus": "mergeable",
+    "difficulty": "easy",
+    "effortEstimate": "~half day",
+    "recommendedAction": "rebase-and-finish",
+    "priority": "low",
+    "rationale": "Unlike most legacy PRs in this batch, #718 is recent (2026-01-09), GitHub reports it MERGEABLE, and it aligns with the CURRENT post-reorg layout — it already targets internal/context/context.go and internal/generator/generator.go. The var block, Docker()/SetServerInfo() in context.go and getContainers()/the three generation loops in generator.go match the PR's diff context exactly, so it applies essentially as-is. I type-checked the exact API the PR relies on (c.ListServices, docker.ListServicesOptions{Status, Filters}, and every swarm.Service field access: Spec.Name/Labels/EndpointSpec.Mode/Mode.Replicated.Replicas/Mode.Global, UpdateStatus.State) against the vendored go-dockerclient v1.13.2 in go.mod and it compiles cleanly, so the dependency surface is present and compatible. Template wiring also works: executeTemplate in internal/template/template.go passes &containers (a *context.Context) as the template root, and the PR's Service() is a method on *Context, so .Service resolves. There is currently NO Swarm service support in the codebase (only the unrelated legacy SwarmNode struct in context.go), so this is a genuinely new capability. The reason this is not turnkey: the feature is half-finished. g.generateFromServices() is left commented out in Generate() (generator.go line ~82); an unused type Service struct{Name string} is added; there is no opt-in flag/config so getServices() runs ListServices() on EVERY cycle even against non-Swarm daemons, and on error it logs and returns, which would ABORT container generation for non-Swarm users — a real regression. There are also no tests (the author's lone comment admits a failing test), no README/docs, and only a throwaway demo template. So the idea is sound and cheaply rebased, but finishing it properly (gate behind a flag, avoid breaking non-Swarm setups, drop dead code, add a test + docs) is the actual work.",
+    "conflictAssessment": "GitHub reports MERGEABLE (mergeStateStatus BLOCKED only due to required CI/review, not text conflicts). The diff's context lines match the current internal/context/context.go and internal/generator/generator.go, so a rebase onto main should apply with little to no manual conflict resolution. Main divergence is conceptual, not textual: the feature is incomplete (commented-out generateFromServices, unused Service struct, no opt-in gating).",
+    "keyFiles": [
+      "internal/context/context.go",
+      "internal/generator/generator.go",
+      "internal/template/template.go",
+      "templates/services.tmpl",
+      "go.mod"
+    ],
+    "relatedIssues": []
+  }
+]
